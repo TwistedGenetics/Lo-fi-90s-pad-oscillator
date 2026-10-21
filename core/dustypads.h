@@ -27,6 +27,11 @@
  *   - everything slow (pitch, drift, detune, weights, filter coefficients,
  *     crusher settings) is worked out once per buffer per voice; the sample
  *     loop only steps linear ramps
+ *   - the per-sample work runs in passes, short loops over the buffer that
+ *     each fit in the NEON registers (one big loop spilled to the stack on
+ *     the Cortex-A7 and crackled: v1.0.0)
+ *   - no `?:` min/max patterns or stored compare masks in the sample loops:
+ *     GCC 10 turns those into four scalar compares on ARM
  *   - saws are DPW (differentiated parabola), sines are refined parabolas,
  *     no tables, no divides in the sample loop, no memory allocation
  *   - a timbre whose weight is zero on every lane is not computed at all,
@@ -123,13 +128,7 @@ static DP_INLINE float sel(bool m, float a, float b) { return m ? a : b; }
 static DP_INLINE v4f sel(v4i m, v4f a, v4f b) { return m ? a : b; }
 
 static DP_INLINE float absv(float x) { return __builtin_fabsf(x); }
-static DP_INLINE v4f absv(v4f x) {
-  v4u b;
-  memcpy(&b, &x, 16);
-  b &= 0x7FFFFFFFu;
-  memcpy(&x, &b, 16);
-  return x;
-}
+static DP_INLINE v4f absv(v4f x) { return (v4f)((v4u)x & 0x7FFFFFFFu); }
 
 // truncate toward zero
 static DP_INLINE float truncv(float x) { return (float)(int32_t)x; }
@@ -156,6 +155,9 @@ static DP_INLINE v4f bitsToNoise(v4u u) {
   memcpy(&f, &u, 16);
   return 2.f * f - 3.f;
 }
+
+// clamp to [-1, 1] with two abs (no compares): 0.5 * (|x + 1| - |x - 1|)
+template <class V> static DP_INLINE V clamp1(V x) { return 0.5f * (absv(x + 1.f) - absv(x - 1.f)); }
 
 template <class V> static DP_INLINE V clampv(V x, float lo, float hi) {
   x = sel(x < lo, splat<V>(lo), x);
@@ -506,177 +508,232 @@ class PadEngine {
     float cmmax = 0.f;
     for (int j = 0; j < N; ++j) cmmax = maxf(cmmax, maxf(lget(e.cm, j), lget(z_.cm, j)));
     const bool needCrush = cmmax > 0.f;
-    const V hissAmt = splat<V>(p_hiss_ * p_hiss_ * 0.12f);
 
-    // ramps
-    V w[Params::kNumTimbres], dw[Params::kNumTimbres];
-    for (int k = 0; k < Params::kNumTimbres; ++k) {
-      w[k] = z_.w[k];
-      dw[k] = (e.w[k] - z_.w[k]) * inv_n;
-    }
-    V ca = z_.ca, dca = (e.ca - z_.ca) * inv_n;
-    V cb = z_.cb, dcb = (e.cb - z_.cb) * inv_n;
-    V lg = z_.lg, dlg = (e.lg - z_.lg) * inv_n;
-    V hg = z_.hg, dhg = (e.hg - z_.hg) * inv_n;
-    V cm = z_.cm, dcm = (e.cm - z_.cm) * inv_n;
-    V pw = pw_z_, dpw = (pwE - pw_z_) * inv_n;
-
-    // DPW history primed from the phase of the last rendered sample, every
-    // buffer: always valid, even for a part that was skipped last buffer
-    V phA = ph_[0], phB = ph_[1];
-    V pS[2], pA[2], pC[2];
-    {
-      const V tA = wrap1(2.f * phA - sel(phA >= 0.5f, splat<V>(1.f), splat<V>(0.f)));
-      const V tB = wrap1(2.f * phB - sel(phB >= 0.5f, splat<V>(1.f), splat<V>(0.f)));
-      pS[0] = parab(tA);
-      pS[1] = parab(tB);
-      pA[0] = parab(wrap1(tA + pw));
-      pA[1] = parab(wrap1(tB + pw));
-      pC[0] = parab(wrap1(tA + 0.25f));
-      pC[1] = parab(wrap1(tB + 0.25f));
-    }
-
+    // ---- per sample, in passes over the buffer ---------------------------
+    // Each pass is a short loop that keeps its few values in NEON registers.
+    // (One big loop doing everything ran out of registers on the Cortex-A7 and
+    // spent most of its time spilling to the stack, which crackled.)
     const V zero = splat<V>(0.f);
-    V sv1[3], sv2[3];
-    for (int f = 0; f < 3; ++f) {
-      sv1[f] = sv1_[f];
-      sv2[f] = sv2_[f];
-    }
-    V tlp = tone_lp_, hlp = hiss_lp_, hval = hval_, hacc = hacc_, sm1 = sm1_, sm2 = sm2_;
-    V dcx = dcx_, dcy = dcy_;
-    U ns;
-    for (int j = 0; j < N; ++j) lset_u(ns, j, noise_s_[j]);
+    V *const acc = buf_acc_;
+    V *const tb = buf_t_;
+    V *const phb = buf_ph_;
+    V *const sawb = buf_saw_;
+    V *const cho = buf_cho_;
+    for (uint32_t s = 0; s < n; ++s) acc[s] = zero;
+    if (needCho)
+      for (uint32_t s = 0; s < n; ++s) cho[s] = zero;
 
-    const float kGlassIdx = 0.22f;
+    for (int c = 0; c < 2; ++c) {
+      if (c == 1 && !runB) break;
+      const V wsub = c == 0 ? wsubA : wsubB;
+      const V inv = c == 0 ? invA : invB;
+      const V g0 = c == 0 ? z_.ca : z_.cb;
+      const V g1 = c == 0 ? e.ca : e.cb;
 
-    for (uint32_t i = 0; i < n; ++i) {
-      V sum = zero, choIn = zero;
+      // DPW history: the parabola one sample back (the last sample of the
+      // previous buffer). Primed every buffer, so it's always valid, even for
+      // a part that was skipped last buffer.
+      V tPrev;
+      {
+        const V ph = ph_[c];
+        tPrev = wrap1(2.f * ph - sel(ph >= 0.5f, splat<V>(1.f), splat<V>(0.f)));
+      }
 
-      // ---- one ensemble copy ----
-      for (int c = 0; c < 2; ++c) {
-        if (c == 1 && !runB) break;
-        V &ph = c == 0 ? phA : phB;
-        const V wsub = c == 0 ? wsubA : wsubB;
-        const V inv = c == 0 ? invA : invB;
-        const V gainc = c == 0 ? ca : cb;
-        ph = ph + wsub;
-        ph = sel(ph >= 1.f, ph - 1.f, ph);
-        V t = 2.f * ph;
-        t = sel(t >= 1.f, t - 1.f, t);
-
-        V part = zero;
-        if (needSaw) {
-          // falling saw: its fundamental is in phase with the sines, so
-          // crossfades between neighbouring timbres don't cancel
-          const V saw = -dpwSaw(t, pS[c], inv);
-          part = part + w[Params::kTStrings] * saw;
-          if (needAna) {
-            const V s2 = -dpwSaw(wrap1(t + pw), pA[c], inv);
-            part = part + w[Params::kTAnalog] * (0.6f * saw + 0.5f * (saw - s2));
-          }
-          if (needCho) {
-            const V s3 = -dpwSaw(wrap1(t + 0.25f), pC[c], inv);
-            choIn = choIn + gainc * (saw - s3);
-          }
+      // pass: phase. ph runs at half the note (the organ's 16'), t at the note
+      {
+        V ph = ph_[c];
+        for (uint32_t s = 0; s < n; ++s) {
+          ph = ph + wsub;
+          ph = sel(ph >= 1.f, ph - 1.f, ph);
+          phb[s] = ph;
+          V t = 2.f * ph;
+          tb[s] = sel(t >= 1.f, t - 1.f, t);
         }
-        if (needOrg) {
-          // drawbars 16' 8' 4' 2 2/3'
-          const V t4 = sel(2.f * t >= 1.f, 2.f * t - 1.f, 2.f * t);
+        ph_[c] = ph;
+      }
+
+      // pass: falling DPW saw (STRINGS; kept in sawb for ANALOG and CHOIR).
+      // Falling, so its fundamental is in phase with the sines and crossfades
+      // between neighbouring timbres don't cancel.
+      if (needSaw) {
+        V k = g0 * z_.w[Params::kTStrings];
+        const V dk = (g1 * e.w[Params::kTStrings] - k) * inv_n;
+        V prev = parab(tPrev);
+        for (uint32_t s = 0; s < n; ++s) {
+          const V p = parab(tb[s]);
+          const V saw = (prev - p) * inv;
+          prev = p;
+          sawb[s] = saw;
+          acc[s] = acc[s] + k * saw;
+          k = k + dk;
+        }
+      }
+
+      // pass: ANALOG = saw + PWM pulse (saw minus a phase-shifted saw)
+      if (needAna) {
+        V k = g0 * z_.w[Params::kTAnalog];
+        const V dk = (g1 * e.w[Params::kTAnalog] - k) * inv_n;
+        V pw = pw_z_;
+        const V dpw = (pwE - pw_z_) * inv_n;
+        V prev = parab(wrap1(tPrev + pw));
+        for (uint32_t s = 0; s < n; ++s) {
+          const V p = parab(wrap1(tb[s] + pw));
+          const V s2 = (prev - p) * inv;
+          prev = p;
+          acc[s] = acc[s] + k * (1.1f * sawb[s] - 0.5f * s2);
+          k = k + dk;
+          pw = pw + dpw;
+        }
+      }
+
+      // pass: CHOIR source = narrow pulse, summed over both copies, formants later
+      if (needCho) {
+        V k = g0;
+        const V dk = (g1 - g0) * inv_n;
+        V prev = parab(wrap1(tPrev + 0.25f));
+        for (uint32_t s = 0; s < n; ++s) {
+          const V p = parab(wrap1(tb[s] + 0.25f));
+          const V s3 = (prev - p) * inv;
+          prev = p;
+          cho[s] = cho[s] + k * (sawb[s] - s3);
+          k = k + dk;
+        }
+      }
+
+      // pass: ORGAN, drawbars 16' 8' 4' 2 2/3'
+      if (needOrg) {
+        V k = g0 * z_.w[Params::kTOrgan];
+        const V dk = (g1 * e.w[Params::kTOrgan] - k) * inv_n;
+        for (uint32_t s = 0; s < n; ++s) {
+          const V t = tb[s];
+          V t4 = 2.f * t;
+          t4 = sel(t4 >= 1.f, t4 - 1.f, t4);
           V t3 = 3.f * t;
           t3 = sel(t3 >= 1.f, t3 - 1.f, t3);
           t3 = sel(t3 >= 1.f, t3 - 1.f, t3);
-          const V org = 0.7f * sin2pi(ph) + sin2pi(t) + 0.55f * sin2pi(t4) + 0.4f * sin2pi(t3);
-          part = part + w[Params::kTOrgan] * org;
+          const V org = 0.7f * sin2pi(phb[s]) + sin2pi(t) + 0.55f * sin2pi(t4) + 0.4f * sin2pi(t3);
+          acc[s] = acc[s] + k * org;
+          k = k + dk;
         }
-        if (needGls) {
-          const V t2 = sel(2.f * t >= 1.f, 2.f * t - 1.f, 2.f * t);
-          const V t4 = sel(2.f * t2 >= 1.f, 2.f * t2 - 1.f, 2.f * t2);
-          const V pm = sin2pi(wrap1(t + kGlassIdx * sin2pi(t2)));
-          part = part + w[Params::kTGlass] * (0.8f * pm + 0.3f * sin2pi(t4));
-        }
-        sum = sum + gainc * part;
       }
 
-      // ---- choir formants (shared by both copies) ----
-      if (needCho) {
-        V cho = 0.12f * choIn;
-        static const float fg[3] = {1.f, 0.75f, 0.35f};
-        for (int f = 0; f < 3; ++f) {
-          const V v3 = choIn - sv2[f];
-          const V v1 = sv_a1_[f] * sv1[f] + sv_a2_[f] * v3;
-          const V v2 = sv2[f] + sv_a2_[f] * sv1[f] + sv_a3_[f] * v3;
-          sv1[f] = 2.f * v1 - sv1[f];
-          sv2[f] = 2.f * v2 - sv2[f];
-          cho = cho + (fg[f] * sv_k_[f]) * v1;
+      // pass: GLASS, 2:1 phase-mod sine + 4th harmonic
+      if (needGls) {
+        V k = g0 * z_.w[Params::kTGlass];
+        const V dk = (g1 * e.w[Params::kTGlass] - k) * inv_n;
+        for (uint32_t s = 0; s < n; ++s) {
+          const V t = tb[s];
+          V t2 = 2.f * t;
+          t2 = sel(t2 >= 1.f, t2 - 1.f, t2);
+          V t4 = 2.f * t2;
+          t4 = sel(t4 >= 1.f, t4 - 1.f, t4);
+          const V pm = sin2pi(wrap1(t + 0.22f * sin2pi(t2)));
+          acc[s] = acc[s] + k * (0.8f * pm + 0.3f * sin2pi(t4));
+          k = k + dk;
         }
-        sum = sum + w[Params::kTChoir] * cho;
       }
+    }
 
-      // ---- tone tilt ----
-      tlp = tlp + toneA * (sum - tlp);
-      V x = lg * tlp + hg * (sum - tlp);
+    // keep copy B's phase moving while it's skipped, so it re-enters freely
+    if (!runB) ph_[1] = fracp(ph_[1] + (float)n * wsubB);
 
-      // ---- hiss, "in the sample" ----
-      if (needHiss) {
+    // pass: CHOIR formants, one band-pass at a time, into tb (free by now)
+    if (needCho) {
+      for (uint32_t s = 0; s < n; ++s) tb[s] = 0.12f * cho[s];
+      static const float fg[3] = {1.f, 0.75f, 0.35f};
+      for (int f = 0; f < 3; ++f) {
+        const float a1 = sv_a1_[f], a2 = sv_a2_[f], a3 = sv_a3_[f], gk = fg[f] * sv_k_[f];
+        V s1 = sv1_[f], s2 = sv2_[f];
+        for (uint32_t s = 0; s < n; ++s) {
+          const V v3 = cho[s] - s2;
+          const V v1 = a1 * s1 + a2 * v3;
+          const V v2 = s2 + a2 * s1 + a3 * v3;
+          s1 = 2.f * v1 - s1;
+          s2 = 2.f * v2 - s2;
+          tb[s] = tb[s] + gk * v1;
+        }
+        sv1_[f] = s1;
+        sv2_[f] = s2;
+      }
+      V k = z_.w[Params::kTChoir];
+      const V dk = (e.w[Params::kTChoir] - k) * inv_n;
+      for (uint32_t s = 0; s < n; ++s) {
+        acc[s] = acc[s] + k * tb[s];
+        k = k + dk;
+      }
+    }
+
+    // pass: TONE tilt
+    {
+      V tlp = tone_lp_;
+      V lg = z_.lg, hg = z_.hg;
+      const V dlg = (e.lg - z_.lg) * inv_n, dhg = (e.hg - z_.hg) * inv_n;
+      for (uint32_t s = 0; s < n; ++s) {
+        const V x = acc[s];
+        tlp = tlp + toneA * (x - tlp);
+        acc[s] = lg * tlp + hg * (x - tlp);
+        lg = lg + dlg;
+        hg = hg + dhg;
+      }
+      tone_lp_ = tlp;
+    }
+
+    // pass: HISS, "in the sample" (before the sampler)
+    if (needHiss) {
+      const V amt = splat<V>(p_hiss_ * p_hiss_ * 0.12f);
+      U ns;
+      for (int j = 0; j < N; ++j) lset_u(ns, j, noise_s_[j]);
+      V hlp = hiss_lp_;
+      for (uint32_t s = 0; s < n; ++s) {
         ns ^= ns << 13;
         ns ^= ns >> 17;
         ns ^= ns << 5;
         const V wn = bitsToNoise(ns);
         hlp = hlp + 0.25f * (wn - hlp);
-        x = x + hissAmt * (wn - hlp);
+        acc[s] = acc[s] + amt * (wn - hlp);
       }
+      hiss_lp_ = hlp;
+      for (int j = 0; j < N; ++j) noise_s_[j] = lget_u(ns, j);
+    }
 
-      // ---- sampler: hold + bits, then output smoothing ----
-      if (needCrush) {
+    // pass: SAMPLER, hold + bits, two-pole output smoothing, crossfaded in
+    if (needCrush) {
+      V hacc = hacc_, hval = hval_, sm1 = sm1_, sm2 = sm2_;
+      V cm = z_.cm;
+      const V dcm = (e.cm - z_.cm) * inv_n;
+      for (uint32_t s = 0; s < n; ++s) {
+        const V x = acc[s];
         V r = x * invStepV;
         r = truncv(r + sel(r >= 0.f, splat<V>(0.5f), splat<V>(-0.5f)));
-        const V q = r * stepV;
-        hacc = hacc + incV;
-        const auto tick = hacc >= 1.f;
-        hacc = sel(tick, hacc - 1.f, hacc);
-        hval = sel(tick, q, hval);
+        const V h = hacc + incV;
+        hval = sel(h >= 1.f, r * stepV, hval);
+        hacc = sel(h >= 1.f, h - 1.f, h);
         sm1 = sm1 + smA * (hval - sm1);
         sm2 = sm2 + smA * (sm1 - sm2);
-        x = x + cm * (sm2 - x);
+        acc[s] = x + cm * (sm2 - x);
+        cm = cm + dcm;
       }
-
-      // DC blocker (~8 Hz), output level, hard ceiling (normal levels peak
-      // well under it, so it only catches extreme settings)
-      const V dc = x - dcx;
-      dcx = x;
-      dcy = dc + 0.999f * dcy;
-      out[i] = clampv(kOutLevel * dcy, -1.f, 1.f) * liveV;
-
-      for (int k = 0; k < Params::kNumTimbres; ++k) w[k] = w[k] + dw[k];
-      ca = ca + dca;
-      cb = cb + dcb;
-      lg = lg + dlg;
-      hg = hg + dhg;
-      cm = cm + dcm;
-      pw = pw + dpw;
+      hacc_ = hacc;
+      hval_ = hval;
+      sm1_ = sm1;
+      sm2_ = sm2;
     }
 
-    // keep copy B's phase moving while it's skipped, so it re-enters freely
-    if (!runB) {
-      phB = phB + (float)n * wsubB;
-      phB = fracp(phB);
+    // pass: DC blocker (~8 Hz), output level, hard ceiling (normal levels peak
+    // well under it, so it only catches extreme settings), idle lanes silent
+    {
+      V dcx = dcx_, dcy = dcy_;
+      const V gain = kOutLevel * liveV;
+      for (uint32_t s = 0; s < n; ++s) {
+        const V x = acc[s];
+        dcy = (x - dcx) + 0.999f * dcy;
+        dcx = x;
+        out[s] = clamp1(gain * dcy);
+      }
+      dcx_ = dcx;
+      dcy_ = dcy;
     }
 
-    ph_[0] = phA;
-    ph_[1] = phB;
-    for (int f = 0; f < 3; ++f) {
-      sv1_[f] = sv1[f];
-      sv2_[f] = sv2[f];
-    }
-    tone_lp_ = tlp;
-    hiss_lp_ = hlp;
-    hval_ = hval;
-    hacc_ = hacc;
-    sm1_ = sm1;
-    sm2_ = sm2;
-    dcx_ = dcx;
-    dcy_ = dcy;
-    for (int j = 0; j < N; ++j) noise_s_[j] = lget_u(ns, j);
     z_ = e;
     pw_z_ = pwE;
   }
@@ -709,6 +766,9 @@ class PadEngine {
   V tone_lp_, hiss_lp_, hval_, hacc_, sm1_, sm2_, dcx_, dcy_;
   Ctl z_;
   V pw_z_;
+
+  // per-buffer work space (one buffer is at most 64 samples)
+  V buf_acc_[64], buf_t_[64], buf_ph_[64], buf_saw_[64], buf_cho_[64];
 };
 
 typedef PadEngine<float> DustyPads1;

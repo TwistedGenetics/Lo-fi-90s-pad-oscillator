@@ -87,13 +87,23 @@ Start from the defaults (Timbre 180, Grit 300, Ensemble 60 %, Drift 35 %, Tone 0
 
 ## CPU
 
-Dusty Pads uses no tables and allocates no memory. Everything slow (pitch, drift, detune, timbre weights, filter coefficients, sampler settings) is worked out once per buffer; the per-sample work is DPW saws, parabolic sines and a few one-pole filters. A timbre whose weight is zero isn't computed at all, the second ensemble copy is skipped while ENSEMBLE is 0, and the sampler section is skipped while it's fully bypassed (GRIT 0, RESAMPLE OFF, KEY TRACK OFF). On the microKORG 2 the four voices of each group run in the four NEON lanes, and idle groups are skipped.
+Dusty Pads uses no tables and allocates no memory. Everything slow (pitch, drift, detune, timbre weights, filter coefficients, sampler settings) is worked out once per buffer. The per-sample work runs **in passes**: phase, saw, PWM, choir source, organ, glass, formants, tone, hiss, sampler and output are each a short loop over the buffer that fits in the NEON registers. A timbre whose weight is zero isn't computed at all, the second ensemble copy is skipped while ENSEMBLE is 0, and the sampler section is skipped while it's fully bypassed (GRIT 0, RESAMPLE OFF, KEY TRACK OFF). On the microKORG 2 the four voices of each group run in the four NEON lanes, and idle groups are skipped.
 
-- **Desktop** (test harness, 8 voices): about 140 ns per sample with the defaults, about 220 ns with ORGAN and everything up, and about 335 ns in the worst case (all five timbres running at once through per-voice modulation). That's roughly 1.1–2.5× the cost of Rollers' microKORG 2 renderer on the same machine.
-- **microKORG 2** (Cortex-A7, up to 8 voices): Korg doesn't publish the per-oscillator budget, so check with DPmeter. If a big chord crackles, the cheapest fixes are ENSEMBLE 0 (halves the oscillator work), staying between two neighbouring timbres (the normal case) rather than modulating TIMBRE across the whole range, or fewer voices in the patch.
-- **NTS-1 mkII** (Cortex-M7, one voice): an estimate, not a measurement; one voice is a small fraction of the CPU.
+**v1.0.1 fixed crackling on the microKORG 2.** v1.0.0 did everything in one big per-sample loop. On the Cortex-A7 that loop ran out of registers and spent most of its time moving values to and from the stack, and two parts of it (the sampler and the output ceiling) were compiled as four scalar operations instead of one NEON operation. The pass structure is the same fix Rollers got in its v1.1.0. The sound is unchanged (the output matches v1.0.0 to within 0.0002).
 
-The NTS-1 unit is ~9 KB (limit 48 KB) and links no library code beyond the pitch table the firmware provides.
+ARM instructions per sample for one group of four voices, counted by running the microKORG 2 code (GCC, Cortex-A7 NEON flags) under an instruction-counting emulator:
+
+| Setting | v1.0.0 | v1.0.1 |
+|---|---|---|
+| Defaults (strings/analog, ensemble, grit, hiss) | 588 | **266** |
+| Ah choir starter setting | 1999 | **469** |
+| Organ with everything at max | 2475 | **489** |
+| Worst case (all five timbres at once via per-voice mod, everything at max) | 3807 | **671** |
+| *For reference: Rollers v1.1.0, HOOVER worst case (runs fine on the synth)* | | *802* |
+
+Korg doesn't publish the per-oscillator budget, so check with DPmeter. If a big chord still crackles, the cheapest fixes are ENSEMBLE 0 (halves the oscillator work), staying between two neighbouring timbres rather than modulating TIMBRE across the whole range, or fewer voices in the patch.
+
+The NTS-1 mkII runs one voice of the same code (a small fraction of its CPU, an estimate rather than a measurement). Its unit is ~9 KB (limit 48 KB) and links no library code beyond the pitch table the firmware provides.
 
 ## Building
 

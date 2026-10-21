@@ -1,0 +1,95 @@
+name: Build Dusty Pads
+
+# Every push / PR builds both units and runs the DSP tests.
+# Releases: when the .version in both header.c files is a version that has no
+# Release yet (e.g. 0x00010000U = v1.0.0) and is pushed to main, Actions tags
+# it and publishes a new Release with both unit files. Pushing a v* tag also
+# works. Pushes that keep the same version refresh that Release's files.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchains and logue SDK
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-${{ runner.os }}-${{ hashFiles('build.sh') }}
+
+      # NTS-1 mkII: Arm GCC 10.3-2021.10. microKORG 2: Korg's gnueabihf toolchain.
+      # Strict mode: fail rather than fall back to a different compiler.
+      - name: Build units (Korg's toolchains)
+        run: ./build.sh all
+        env:
+          DPADS_STRICT: "1"
+
+      - name: Check both units have the same version
+        run: |
+          a=$(grep -oE '\.version = 0x[0-9A-Fa-f]+' nts1mkii/header.c)
+          b=$(grep -oE '\.version = 0x[0-9A-Fa-f]+' microkorg2/header.c)
+          echo "NTS-1 mkII: $a / microKORG 2: $b"
+          [ "$a" = "$b" ]
+
+      - name: Check the tag matches the unit version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          hex=$(grep -oE '\.version = 0x[0-9A-Fa-f]+' nts1mkii/header.c | grep -oE '0x[0-9A-Fa-f]+')
+          v=$(( hex ))
+          want="v$(( (v >> 16) & 0xFF )).$(( (v >> 8) & 0xFF )).$(( v & 0xFF ))"
+          echo "tag ${GITHUB_REF_NAME}, header.c says $want"
+          [ "$GITHUB_REF_NAME" = "$want" ]
+
+      - name: Run DSP tests
+        run: ./test/run.sh
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DustyPads-units
+          path: |
+            dist/*.nts1mkiiunit
+            dist/*.mk2unit
+            test/out/*.wav
+
+      - name: Read unit version from header.c
+        id: ver
+        run: |
+          hex=$(grep -oE '\.version = 0x[0-9A-Fa-f]+' nts1mkii/header.c | grep -oE '0x[0-9A-Fa-f]+')
+          v=$(( hex ))
+          echo "tag=v$(( (v >> 16) & 0xFF )).$(( (v >> 8) & 0xFF )).$(( v & 0xFF ))" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        if: >-
+          startsWith(github.ref, 'refs/tags/v') ||
+          (github.ref == 'refs/heads/main' && github.event_name != 'pull_request')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Dusty Pads ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || steps.ver.outputs.tag }}
+          make_latest: true
+          files: |
+            dist/DustyPads.nts1mkiiunit
+            dist/DustyPads.mk2unit
+            dist/DPmeter.mk2unit
+          body: |
+            Dusty Pads — lo-fi 90s pad oscillator (strings / analog / organ / choir / glass, ensemble and drift, S950-style sampler grit, resample and key track, hiss) for the Korg microKORG 2 and NTS-1 digital kit mkII.
+
+            **microKORG 2** (firmware 2.0.0 or later) — download `DustyPads.mk2unit` and load it as a user oscillator (see the README for the steps).
+
+            **NTS-1 mkII** — download `DustyPads.nts1mkiiunit`, open KORG KONTROL Editor with the NTS-1 mkII connected, drag the file onto the **oscillator** list and press **SEND**.
+
+            `DPmeter.mk2unit` is optional: the same oscillator with this unit's CPU load shown next to RESAMPLE (e.g. `OFF 37%`). Load it alongside Dusty Pads if you hear crackles and want to see how close to the limit it is.
+
+            Controls and starter settings: see the [README](https://github.com/${{ github.repository }}#readme).
